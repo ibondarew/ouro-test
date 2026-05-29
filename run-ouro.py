@@ -34,7 +34,7 @@ class TimeLimitCallback(TrainerCallback):
         elapsed = time.time() - self.start_time
         local_stop = elapsed >= self.max_time
 
-        # Синхронизируем флаг остановки между всеми 8 GPU
+        # Синхронизируем флаг остановки между всеми активными GPU
         if dist.is_initialized():
             stop_tensor = torch.tensor([1.0 if local_stop else 0.0], device=args.device)
             dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
@@ -68,41 +68,61 @@ def main():
         torch_dtype=torch.bfloat16,  # bfloat16 — нативный и самый быстрый формат для H100
     )
 
-    # 2. ПОДГОТОВКА ДАТАСЕТА
-    # ЗАМЕНИТЕ ЭТОТ БЛОК НА ВАШ ДАТАСЕТ (например, load_dataset("json", data_files="..."))
+    # 2. ПОДГОТОВКА ДАТАСЕТА (с упаковкой в блоки по 2048 токенов)
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
     def tokenize_function(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=2048)
+        # Просто переводим текст в токены без обрезки на данном этапе
+        return tokenizer(examples["text"], add_special_tokens=False)
 
     tokenized_dataset = dataset.map(
         tokenize_function, batched=True, remove_columns=["text"]
     )
 
+    def group_texts(examples):
+        block_size = 2048
+        # Склеиваем все списки токенов в один сплошной поток (избавляет от пустых строк)
+        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+
+        # Округляем до длины, кратной block_size
+        if total_length >= block_size:
+            total_length = (total_length // block_size) * block_size
+
+        # Нарезаем на плотные куски ровно по block_size токенов
+        result = {
+            k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+            for k, t in concatenated_examples.items()
+        }
+        return result
+
+    # Финальный упакованный датасет без пустых элементов
+    packed_dataset = tokenized_dataset.map(group_texts, batched=True, batch_size=1000)
+
     # 3. Конфигурация обучения
     training_args = TrainingArguments(
         output_dir="./ouro_output",
         overwrite_output_dir=True,
-        # Для модели 2.6B на картах H100 80GB можно ставить большой батч-сайз (16–32 и выше)
-        per_device_train_batch_size=16,
-        gradient_accumulation_steps=1,
+        per_device_train_batch_size=8,  # Безопасный батч для старта
+        gradient_accumulation_steps=2,  # Аккумуляция для компенсации меньшего числа GPU (3 вместо 8)
         learning_rate=2e-5,
         logging_steps=10,
         save_steps=500,
-        bf16=True,  # Включаем bfloat16
+        bf16=True,  # Обязательно для H100
         fp16=False,
-        # Задаем заведомо огромное число шагов. Реальной отсечкой будет управлять Колбэк.
-        max_steps=1000000,
+        max_steps=1000000,  # Ограничением управляет TimeLimitCallback
         dataloader_num_workers=4,
         ddp_find_unused_parameters=False,
         report_to="none",
+        gradient_checkpointing=True,  # Жёсткая защита от OOM (высвобождает ~50-60% памяти)
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
     # 4. Инициализация Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_dataset,
+        train_dataset=packed_dataset,  # Используем подготовленный плотный датасет
         data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         callbacks=[TimeLimitCallback(max_time_seconds)],
     )
@@ -110,7 +130,7 @@ def main():
     # Запуск процесса
     trainer.train()
 
-    # Сохраняем финальные веса после остановки (только на нулевом GPU)
+    # Сохраняем веса после остановки (только на главном GPU)
     if trainer.is_world_process_zero():
         print("Сохранение финальной модели...")
         trainer.save_model("./ouro_final_model")
